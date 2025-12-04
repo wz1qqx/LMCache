@@ -334,17 +334,13 @@ class MessageQueueServer:
         self.ctx = context
         self.socket = self.ctx.socket(zmq.ROUTER)
         self.socket.bind(bind_url)
-        # Output task notifier socket and output queue
-
-        self.output_notifier, self.output_waiter = prepare_internal_push_pull_sockets(
-            self.ctx
-        )
+        # Output queue for responses from blocking handlers
+        # Thread-safe queue that can be safely accessed from worker threads
         self.output_queue: queue.Queue = queue.Queue()
 
         # Poller
         self.poller = zmq.Poller()
         self.poller.register(self.socket, zmq.POLLIN)
-        self.poller.register(self.output_waiter, zmq.POLLIN)
 
         # Main loop thread
         self.is_finished = threading.Event()
@@ -406,16 +402,12 @@ class MessageQueueServer:
                     else prefix_frames
                 )
 
+                # Put response in thread-safe queue (main loop will poll this queue)
                 self.output_queue.put(frames_to_send)
-                self.output_notifier.send(b"1")
 
             except Exception as e:
                 logger.error("Error in blocking handler: %s", e)
 
-        # TODO: HERE'S A BUG: WE CANNOT SEND RESPONSE IN THE FUTURE THREAD
-        # BECAUSE THE OUTPUT ZMQ SOCKET IS NOT THREAD-SAFE.
-        # WE SHOULD USE A ZMQ SOCKET TO NOTIFY THE MAIN THREAD TO SEND THE
-        # RESPONSE AND USE THE THREAD-QUEUE TO PASS THE RESPONSE DATA
         future.add_done_callback(_notify_response)
 
     def _call_handler(
@@ -440,7 +432,6 @@ class MessageQueueServer:
         while not self.is_finished.is_set():
             socks = dict(self.poller.poll(1000))
             inbound_state = socks.get(self.socket, None)
-            outbound_state = socks.get(self.output_waiter, None)
 
             # Process the incoming requests
             if inbound_state and inbound_state & zmq.POLLIN:
@@ -468,21 +459,14 @@ class MessageQueueServer:
                     )
                     logger.error("Available handlers: %s", list(self.handlers.keys()))
 
-            # Send the responses
-            if outbound_state and outbound_state & zmq.POLLIN:
-                # Drain the notifier
-                while True:
-                    try:
-                        self.output_waiter.recv(zmq.DONTWAIT)
-                    except zmq.Again:
-                        break
-
-                # Process the output tasks
-                try:
-                    while frames_to_send := self.output_queue.get_nowait():
-                        self.socket.send_multipart(frames_to_send)
-                except queue.Empty:
-                    pass
+            # Send the responses from blocking handlers
+            # Directly poll output_queue (thread-safe, can be checked from main thread)
+            # Process all pending responses
+            try:
+                while frames_to_send := self.output_queue.get_nowait():
+                    self.socket.send_multipart(frames_to_send)
+            except queue.Empty:
+                pass
 
     def _inspect_handler_signature(self, request_type: RequestType, handler) -> bool:
         """Inspect the handler signature to ensure it matches the expected
